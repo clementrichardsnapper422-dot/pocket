@@ -14,17 +14,20 @@
 
 'use strict'
 
+import { DEFAULT_POLICY_EXCLUSIONS, WILDCARD } from './constants.js'
 import { createPolicyEnforcedAccount } from './policy-account-proxy.js'
 import { PolicyConfigurationError } from './policy-error.js'
 import { evaluate } from './policy-evaluator.js'
 import PolicyRegistry from './policy-registry.js'
 import {
+  validateEngineOptions,
   validatePolicy,
   validateRegisterOptions
 } from './policy-validators.js'
 
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccount} IWalletAccount */
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccountReadOnly} IWalletAccountReadOnly */
+/** @typedef {import('./policy-error.js').DenialCode} DenialCode */
 
 /**
  * The verdict a matching rule produces: either permit the operation or block it.
@@ -39,14 +42,12 @@ import {
  */
 
 /**
- * A wrapped operation name from the supported set, or `*` to match any wrapped operation.
- * Each name must match an actual method on `IWalletAccount` or a registered protocol.
+ * The name of a governed method, or `*` to match any of them. Every callable a
+ * wallet or protocol exposes is governed unless it appears in the engine's
+ * exclusion set, so this is any method name rather than a fixed set. A name
+ * that matches nothing on the account registers fine and never fires.
  *
- * @typedef {'sendTransaction' | 'signTransaction' | 'transfer' | 'approve'
- *   | 'sign' | 'signTypedData' | 'signAuthorization' | 'delegate' | 'revokeDelegation'
- *   | 'swap' | 'bridge' | 'supply' | 'withdraw' | 'borrow' | 'repay' | 'buy' | 'sell'
- *   | 'swidge' | 'createDepositAddress' | 'renewDepositAddress'
- *   | 'recoverDepositAddress' | 'disableDepositAddress' | '*'} PolicyOperation
+ * @typedef {string} PolicyOperation
  */
 
 /**
@@ -56,8 +57,7 @@ import {
  * @property {PolicyOperation} operation - The intercepted operation name.
  * @property {string} wallet - The wallet identifier (the same string passed to `wdk.registerWallet`). Despite the name, this is an opaque key chosen by the consumer — it might be a chain name like `"ethereum"`, but it could equally be `"treasury-cold"` or any other label.
  * @property {IWalletAccountReadOnly} account - A read-only view of the wallet account.
- * @property {unknown} params - The first argument to the wrapped method.
- * @property {readonly unknown[]} args - The full argument array.
+ * @property {readonly unknown[]} args - The full argument array the wrapped method was called with, snapshotted at evaluation time. `args[0]` is the first argument; every element is readable, so multi-argument operations (e.g. `swidge(options, config)`) can be gated on any of them.
  */
 
 /**
@@ -78,7 +78,7 @@ import {
  * @property {PolicyOperation | PolicyOperation[]} operation - The wrapped operation(s) this rule addresses. May be a single operation name, an array, or the wildcard `*`.
  * @property {PolicyAction} action - Whether a matching rule allows or denies the operation.
  * @property {boolean} [override_broader_scope] - When true on an account-scope ALLOW rule that matches, the rule's verdict short-circuits project-scope evaluation. Account-scope rules are evaluated in registration order; the first matching override-flag rule wins. Only valid on account-scope ALLOW rules.
- * @property {PolicyCondition[]} conditions - Functions evaluated in order; all must return truthy for the rule to match. Each is raced against `conditionTimeoutMs`.
+ * @property {PolicyCondition[]} conditions - Functions evaluated in order; all must return truthy for the rule to match. Each is raced against the `conditionTimeoutMs` its own policy was registered with.
  * @property {Record<string, unknown>} [state] - Reserved for future use; currently ignored at runtime.
  * @property {(c: PolicyContext) => void | Promise<void>} [onSuccess] - Reserved for future use; currently ignored at runtime.
  */
@@ -105,12 +105,20 @@ import {
  */
 
 /**
- * Engine-wide settings supplied to `registerPolicy` (e.g. per-condition
- * timeout). The most recent call's value wins.
+ * Settings supplied to `registerPolicy`, scoped to the policies that call
+ * registers. Other policies are unaffected.
  *
  * @typedef {Object} RegisterPolicyOptions
  * @property {Record<string, unknown>} [state] - Reserved for future use; currently ignored at runtime.
- * @property {number} [conditionTimeoutMs] - Per-condition evaluation timeout in milliseconds. Defaults to 30000. A condition that exceeds the timeout is treated the same as a throw — fail-closed for DENY rules, fail-open-as-no-match for ALLOW rules. Engine-wide; the most recent registerPolicy call's value wins.
+ * @property {number} [conditionTimeoutMs] - Per-condition evaluation timeout in milliseconds, applied to every policy this call registers. Defaults to 30000. Values above the engine's `maxConditionTimeoutMs` ceiling are capped to that ceiling. A condition that exceeds the timeout is treated the same as a throw — fail-closed for DENY rules, fail-open-as-no-match for ALLOW rules.
+ */
+
+/**
+ * Settings supplied to the `PolicyEngine` constructor.
+ *
+ * @typedef {Object} PolicyEngineOptions
+ * @property {number} [maxConditionTimeoutMs] - Upper bound, in milliseconds, on the per-condition timeout any single policy can be given. Defaults to 30000. A policy registered with a larger `conditionTimeoutMs` is capped to this value rather than rejected.
+ * @property {string[]} [policyExclusions] - Method names to hand through ungoverned, unioned with `DEFAULT_POLICY_EXCLUSIONS`. Append-only: entries cannot be removed from the defaults. Names that match nothing on any registered wallet are accepted without error.
  */
 
 /**
@@ -131,6 +139,8 @@ import {
  *
  * @typedef {Object} SimulationResult
  * @property {'ALLOW' | 'DENY'} decision - The verdict the engine would produce for this context.
+ * @property {DenialCode | null} code - Which denial path produced a DENY, or null on ALLOW. The same value the
+ *   thrown `PolicyViolationError.code` would carry for this context.
  * @property {string | null} policy_id - Id of the policy whose rule produced the verdict, or null when no rule addresses the operation (`no-applicable-rule`) or matched (`governed-but-unmatched`).
  * @property {string | null} matched_rule - Name of the matching rule, or null when no rule matched.
  * @property {string | null} reason - Human-readable explanation: the rule's `reason` field, or one of `matched` / `override` / `no-applicable-rule` / `governed-but-unmatched`.
@@ -161,21 +171,57 @@ import {
 
 const DEFAULT_CONDITION_TIMEOUT_MS = 30_000
 
+const DEFAULT_MAX_CONDITION_TIMEOUT_MS = 30_000
+
 /**
  * The orchestration façade. Owns the registry; exposes the two methods the
  * `WDK` class calls (`register`, `applyPoliciesTo`). Internal helpers
  * (`_isGoverned`, `_evaluateContext`, `_simulateContext`) are used by the
  * wrapper module.
  *
+ * Each registered policy carries the condition timeout it was registered
+ * with; the engine only owns the ceiling that timeout is clamped to.
+ *
  * @internal
  */
 export default class PolicyEngine {
-  constructor () {
+  /**
+   * @param {PolicyEngineOptions} [options] - Engine-level settings such as `maxConditionTimeoutMs` and `policyExclusions`.
+   * @throws {PolicyConfigurationError} If `options` is not a plain object.
+   * @throws {PolicyConfigurationError} If `maxConditionTimeoutMs` is not a finite positive number.
+   * @throws {PolicyConfigurationError} If `policyExclusions` is not an array of non-empty strings.
+   */
+  constructor (options) {
+    validateEngineOptions(options)
+
     /** @private */
     this._registry = new PolicyRegistry()
 
     /** @private */
-    this._conditionTimeoutMs = DEFAULT_CONDITION_TIMEOUT_MS
+    this._maxConditionTimeoutMs = options?.maxConditionTimeoutMs ?? DEFAULT_MAX_CONDITION_TIMEOUT_MS
+
+    /** @private */
+    this._exclusions = new Set([...DEFAULT_POLICY_EXCLUSIONS, ...(options?.policyExclusions ?? [])])
+  }
+
+  /**
+   * Reports whether a method name bypasses evaluation. The proxy asks this for
+   * every callable it considers wrapping.
+   *
+   * @param {string} name - The method name to test.
+   * @returns {boolean} True if calls to this method are handed through ungoverned.
+   */
+  isExcluded (name) {
+    return this._exclusions.has(name)
+  }
+
+  /**
+   * The resolved exclusion set as a frozen array, for consumer introspection.
+   *
+   * @returns {readonly string[]} The method names that bypass evaluation, in insertion order.
+   */
+  getExclusions () {
+    return Object.freeze([...this._exclusions])
   }
 
   /**
@@ -184,9 +230,12 @@ export default class PolicyEngine {
    * never leaves the engine partially mutated.
    *
    * @param {Policy | Policy[]} policies - A single policy or array of policies to register.
-   * @param {RegisterPolicyOptions} [options] - Engine-level settings such as `conditionTimeoutMs`.
+   * @param {RegisterPolicyOptions} [options] - Settings applied to the policies this call registers, such as `conditionTimeoutMs`.
    * @param {RegistrationContext} [registrationContext] - Optional set of registered wallet identifiers. When provided, the engine verifies every wallet binding referenced by the policies is in the set before touching the registry.
-   * @throws {PolicyConfigurationError} If any policy or option fails schema validation, the input is an empty array, or a policy binds to a wallet not present in `registrationContext.knownWallets`.
+   * @throws {PolicyConfigurationError} If any policy or option fails schema validation.
+   * @throws {PolicyConfigurationError} If `policies` is an empty array.
+   * @throws {PolicyConfigurationError} If a policy binds to a wallet not present in `registrationContext.knownWallets`.
+   * @throws {PolicyConfigurationError} If a rule addresses a method in the resolved exclusion set.
    */
   register (policies, options, registrationContext) {
     validateRegisterOptions(options)
@@ -198,6 +247,10 @@ export default class PolicyEngine {
     }
 
     const walletsPerPolicy = list.map((policy) => validatePolicy(policy))
+
+    for (const policy of list) {
+      assertRulesAddressGovernedOperations(policy, this._exclusions)
+    }
 
     const knownWallets = registrationContext?.knownWallets
 
@@ -213,13 +266,14 @@ export default class PolicyEngine {
       }
     }
 
-    list.forEach((policy, i) => {
-      this._registry.add(policy, walletsPerPolicy[i])
-    })
+    const conditionTimeoutMs = Math.min(
+      options?.conditionTimeoutMs ?? DEFAULT_CONDITION_TIMEOUT_MS,
+      this._maxConditionTimeoutMs
+    )
 
-    if (options?.conditionTimeoutMs !== undefined) {
-      this._conditionTimeoutMs = options.conditionTimeoutMs
-    }
+    list.forEach((policy, i) => {
+      this._registry.add(policy, walletsPerPolicy[i], conditionTimeoutMs)
+    })
   }
 
   /**
@@ -264,7 +318,7 @@ export default class PolicyEngine {
   async _evaluateContext (context, { path, index }) {
     const groups = this._registry.applicable(context.wallet, path, index)
 
-    return evaluate(context, groups, { conditionTimeoutMs: this._conditionTimeoutMs })
+    return evaluate(context, groups)
   }
 
   /** @private */
@@ -273,10 +327,37 @@ export default class PolicyEngine {
 
     return {
       decision: verdict.outcome === 'BLOCK' ? 'DENY' : 'ALLOW',
+      code: verdict.code,
       policy_id: verdict.policyId,
       matched_rule: verdict.ruleName,
       reason: verdict.reason,
       trace: verdict.trace
+    }
+  }
+}
+
+/**
+ * Rejects a rule that names an excluded method. Such a rule is well-formed and
+ * registers cleanly, but the proxy never wraps an excluded method, so the rule
+ * can never be evaluated — a DENY that silently permits. The wildcard is
+ * exempt: it means "every governed operation", which is exactly the set that
+ * excludes these names.
+ *
+ * @param {Policy} policy - The validated policy whose rules are being checked.
+ * @param {Set<string>} exclusions - The engine's resolved exclusion set.
+ * @throws {PolicyConfigurationError} If any rule addresses an excluded method.
+ */
+function assertRulesAddressGovernedOperations (policy, exclusions) {
+  for (const rule of policy.rules) {
+    const operations = Array.isArray(rule.operation) ? rule.operation : [rule.operation]
+
+    for (const operation of operations) {
+      if (operation === WILDCARD || !exclusions.has(operation)) continue
+
+      throw new PolicyConfigurationError(
+        `Rule '${rule.name}' in policy '${policy.id}': '${operation}' is an excluded method, so this rule could never be evaluated. ` +
+        "Remove it from the rule, or drop the method from the 'policyExclusions' option so calls to it reach the engine."
+      )
     }
   }
 }

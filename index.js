@@ -18,6 +18,7 @@
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccountReadOnly} IWalletAccountReadOnly */
 /** @typedef {import('./src/wdk.js').FeeRates} FeeRates */
 /** @typedef {import('./src/wdk.js').MiddlewareFunction} MiddlewareFunction */
+/** @typedef {import('./src/wdk.js').WdkOptions} WdkOptions */
 
 /** @typedef {import('./src/wallet-account-with-protocols.js').IWalletAccountWithProtocols} IWalletAccountWithProtocols */
 /** @typedef {import('./src/wdk.js').WdkAccount} WdkAccount */
@@ -32,6 +33,7 @@
 /** @typedef {import('./src/policy/index.js').SimulationResult} SimulationResult */
 /** @typedef {import('./src/policy/index.js').SimulationTraceEntry} SimulationTraceEntry */
 /** @typedef {import('./src/policy/index.js').RegisterPolicyOptions} RegisterPolicyOptions */
+/** @typedef {import('./src/policy/index.js').DenialCode} DenialCode */
 
 export { default } from './src/wdk.js'
-export { PolicyViolationError, PolicyConfigurationError } from './src/policy/index.js'
+export { PolicyViolationError, PolicyConfigurationError, DEFAULT_POLICY_EXCLUSIONS, DENIAL_CODES } from './src/policy/index.js'

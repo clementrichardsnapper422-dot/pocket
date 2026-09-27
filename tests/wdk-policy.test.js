@@ -1,12 +1,14 @@
 'use strict'
 
+import { runInThisContext } from 'node:vm'
+
 import { beforeEach, describe, expect, jest, test } from '@jest/globals'
 
 import WalletManager from '@tetherto/wdk-wallet'
 
-import { BridgeProtocol, SdaProtocol, SwapProtocol, SwidgeProtocol } from '@tetherto/wdk-wallet/protocols'
+import { BridgeProtocol, LendingProtocol, SdaProtocol, SwapProtocol, SwidgeProtocol } from '@tetherto/wdk-wallet/protocols'
 
-import WDK, { PolicyConfigurationError, PolicyViolationError } from '../index.js'
+import WDK, { DEFAULT_POLICY_EXCLUSIONS, DENIAL_CODES, PolicyConfigurationError, PolicyViolationError } from '../index.js'
 
 const SEED_PHRASE = 'cook voyage document eight skate token alien guide drink uncle term abuse'
 
@@ -21,6 +23,8 @@ const DUMMY_BRIDGE_RESULT = { hash: '0xdummy-bridge-hash' }
 const DUMMY_SWIDGE_RESULT = { hash: '0xdummy-swidge-hash' }
 const DUMMY_SDA_ADDRESS_RESULT = [{ address: '0xdummy-deposit-address' }]
 const DUMMY_SDA_ROUTES = [{ sourceChains: ['arbitrum'], destinationChain: 'polygon' }]
+const DUMMY_LIGHTNING_PAYMENT = { id: 'dummy-payment' }
+const DUMMY_EMODE_RESULT = { hash: '0xdummy-emode' }
 const DUMMY_SIGNED_TX = '0xdummy-signed-tx'
 
 // Test inputs (no DUMMY_ prefix per CQ5). Addresses are valid EVM shape
@@ -43,6 +47,8 @@ const quoteTransferMock = jest.fn()
 const getAccountMock = jest.fn()
 const getAccountByPathMock = jest.fn()
 const disposeWalletMock = jest.fn()
+const payInheritedMock = jest.fn()
+const supplyMock = jest.fn()
 
 const WalletManagerMock = jest.fn().mockImplementation(() => {
   return Object.create(WalletManager.prototype, {
@@ -86,6 +92,30 @@ const projectDenyAll = (id) => ({
   rules: [{ name: `${id}-rule`, operation: 'sendTransaction', action: 'DENY', conditions: [] }]
 })
 
+const neverResolvingDeny = (id, operation) => ({
+  id,
+  name: id,
+  scope: 'project',
+  rules: [{
+    name: `${id}-rule`,
+    operation,
+    action: 'DENY',
+    conditions: [() => new Promise(() => {})]
+  }]
+})
+
+const slowAllow = (id, operation, delayMs) => ({
+  id,
+  name: id,
+  scope: 'project',
+  rules: [{
+    name: `${id}-rule`,
+    operation,
+    action: 'ALLOW',
+    conditions: [() => new Promise((resolve) => setTimeout(() => resolve(true), delayMs))]
+  }]
+})
+
 const catchAsync = async (fn) => {
   try { await fn(); return null } catch (err) { return err }
 }
@@ -108,6 +138,8 @@ describe('WDK — policy engine', () => {
     getAccountMock.mockReset()
     getAccountByPathMock.mockReset()
     disposeWalletMock.mockReset()
+    payInheritedMock.mockReset().mockResolvedValue(DUMMY_LIGHTNING_PAYMENT)
+    supplyMock.mockReset().mockResolvedValue({ hash: '0xdummy-supply' })
 
     wdk = new WDK(SEED_PHRASE)
   })
@@ -219,14 +251,36 @@ describe('WDK — policy engine', () => {
       expect(err.message).toBe('Policy \'p\': \'scope\': Invalid option: expected one of "project"|"account"')
     })
 
-    test('throws PolicyConfigurationError on unknown operation', () => {
+    test('throws PolicyConfigurationError on an empty operation name', () => {
       wdk.registerWallet('ethereum', WalletManagerMock, {})
 
-      const policy = { id: 'p', name: 'p', scope: 'project', rules: [{ name: 'r', operation: 'fly', action: 'ALLOW', conditions: [] }] }
+      const policy = { id: 'p', name: 'p', scope: 'project', rules: [{ name: 'r', operation: '', action: 'ALLOW', conditions: [] }] }
       const err = catchSync(() => wdk.registerPolicy(policy))
 
       expect(err.name).toBe('PolicyConfigurationError')
-      expect(err.message).toBe("Rule 'r' in policy 'p': 'operation': Invalid input")
+      expect(err.message).toBe("Rule 'r' in policy 'p': 'operation': Too small: expected string to have >=1 characters")
+    })
+
+    test('accepts an operation name the core package has never heard of', async () => {
+      const payLightningInvoiceMock = jest.fn().mockResolvedValue(DUMMY_LIGHTNING_PAYMENT)
+
+      getAccountMock.mockResolvedValue(buildAccount(PATH_DEFAULT, { payLightningInvoice: payLightningInvoiceMock }))
+
+      wdk
+        .registerWallet('spark', WalletManagerMock, {})
+        .registerPolicy({
+          id: 'lightning',
+          name: 'lightning',
+          scope: 'project',
+          rules: [{ name: 'deny-lightning', operation: 'payLightningInvoice', action: 'DENY', conditions: [] }]
+        })
+
+      const account = await wdk.getAccount('spark', 0)
+      const err = await catchAsync(() => account.payLightningInvoice({ invoice: 'lnbc1' }))
+
+      expect(err.name).toBe('PolicyViolationError')
+      expect(err.ruleName).toBe('deny-lightning')
+      expect(payLightningInvoiceMock).not.toHaveBeenCalled()
     })
 
     test('throws PolicyConfigurationError on invalid action', () => {
@@ -285,12 +339,12 @@ describe('WDK — policy engine', () => {
       wdk.registerWallet('ethereum', WalletManagerMock, {})
 
       const good = projectDenyAll('good')
-      const bad = { id: 'bad', name: 'bad', scope: 'project', rules: [{ name: 'r', operation: 'fly', action: 'ALLOW', conditions: [] }] }
+      const bad = { id: 'bad', name: 'bad', scope: 'project', rules: [{ name: 'r', operation: '', action: 'ALLOW', conditions: [] }] }
 
       const err = catchSync(() => wdk.registerPolicy([good, bad]))
 
       expect(err.name).toBe('PolicyConfigurationError')
-      expect(err.message).toBe("Rule 'r' in policy 'bad': 'operation': Invalid input")
+      expect(err.message).toBe("Rule 'r' in policy 'bad': 'operation': Too small: expected string to have >=1 characters")
 
       // The 'good' policy must NOT have been registered (otherwise the next call would block).
       const account = await wdk.getAccount('ethereum', 0)
@@ -339,7 +393,7 @@ describe('WDK — policy engine', () => {
       const expectedContext = expect.objectContaining({
         operation: 'sendTransaction',
         wallet: 'ethereum',
-        params: { to: RECIPIENT, value: 1n }
+        args: [{ to: RECIPIENT, value: 1n }]
       })
 
       expect(firstCondition).toHaveBeenCalledTimes(1)
@@ -439,7 +493,7 @@ describe('WDK — policy engine', () => {
       expect(account.simulate).toBeUndefined()
     })
 
-    test('every OPERATIONS method on a governed account is wrapped; unaddressed ops BLOCK', async () => {
+    test('every governed method on an account is wrapped; unaddressed ops BLOCK', async () => {
       getAccountMock.mockResolvedValue(buildAccount())
 
       wdk
@@ -453,7 +507,7 @@ describe('WDK — policy engine', () => {
       expect(denied.name).toBe('PolicyViolationError')
       expect(denied.policyId).toBe('only-send')
 
-      // transfer is also wrapped (full OPERATIONS coverage on governed accounts);
+      // transfer is also wrapped (every non-excluded callable is governed);
       // no rule addresses it → BLOCK with `no-applicable-rule`. This is the
       // default-deny semantic that closes the sibling-method bypass: a
       // "cap transfer" policy cannot be sidestepped by calling sendTransaction
@@ -497,8 +551,8 @@ describe('WDK — policy engine', () => {
   // -------------------------------------------------------------------------
   // Coverage of every signing/value-moving primitive on IWalletAccount
   //
-  // The policy engine wraps methods named in OPERATIONS that also exist on
-  // the underlying account. If OPERATIONS or the names diverge from the
+  // The policy engine wraps every callable on the account that is not in the
+  // exclusion set. If the exclusion set or the names diverge from the
   // canonical IWalletAccount API, a policy registers but silently no-ops,
   // which is worse than throwing — these tests pin the contract.
   // -------------------------------------------------------------------------
@@ -583,21 +637,24 @@ describe('WDK — policy engine', () => {
       expect(signMock).not.toHaveBeenCalled()
     })
 
-    test('signMessage and signHash are rejected at registration as unknown operations', () => {
-      const wrong = (op) => ({
-        id: 'p',
-        name: 'p',
-        scope: 'project',
-        rules: [{ name: 'r', operation: op, action: 'DENY', conditions: [] }]
-      })
+    test('a rule naming a method the account does not have registers, never fires, and leaves the real method denied', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
 
-      const errMsg = catchSync(() => wdk.registerPolicy(wrong('signMessage')))
-      const errHash = catchSync(() => wdk.registerPolicy(wrong('signHash')))
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy({
+          id: 'typo',
+          name: 'typo',
+          scope: 'project',
+          rules: [{ name: 'allow-signing', operation: 'signMessage', action: 'ALLOW', conditions: [] }]
+        })
 
-      expect(errMsg.name).toBe('PolicyConfigurationError')
-      expect(errMsg.message).toBe("Rule 'r' in policy 'p': 'operation': Invalid input")
-      expect(errHash.name).toBe('PolicyConfigurationError')
-      expect(errHash.message).toBe("Rule 'r' in policy 'p': 'operation': Invalid input")
+      const account = await wdk.getAccount('ethereum', 0)
+      const err = await catchAsync(() => account.sign('0xdeadbeef'))
+
+      expect(err.name).toBe('PolicyViolationError')
+      expect(err.reason).toBe('no-applicable-rule')
+      expect(signMock).not.toHaveBeenCalled()
     })
   })
 
@@ -624,7 +681,7 @@ describe('WDK — policy engine', () => {
             name: 'cap',
             operation: 'transfer',
             action: 'ALLOW',
-            conditions: [({ params }) => BigInt(params.amount) <= 100n]
+            conditions: [({ args }) => BigInt(args[0].amount) <= 100n]
           }]
         })
 
@@ -947,7 +1004,37 @@ describe('WDK — policy engine', () => {
   // -------------------------------------------------------------------------
 
   describe('PolicyViolationError', () => {
-    test('thrown on DENY carries name, policyId, ruleName, reason, and message', async () => {
+    const NO_APPLICABLE_RULE_MESSAGE = `Policy violation: 'sendTransaction' was denied because no policy rule explicitly allowed it.
+
+No registered rule addresses 'sendTransaction'.
+
+The engine defaults to deny for unmatched operations to prevent restriction bypass via other operations (e.g. sendTransaction calldata, approve, sign, signAuthorization).
+
+To opt into permissive semantics, register a catch-all ALLOW rule and layer specific DENY rules on top:
+
+wdk.registerPolicy({
+  id: 'permissive-baseline',
+  name: 'Permissive baseline',
+  scope: 'project',
+  rules: [{ name: 'allow-all', operation: '*', action: 'ALLOW', conditions: [] }]
+})`
+
+    const GOVERNED_BUT_UNMATCHED_MESSAGE = `Policy violation: 'sendTransaction' was denied because no policy rule explicitly allowed it.
+
+Rules address 'sendTransaction', but none of their conditions matched.
+
+The engine defaults to deny for unmatched operations to prevent restriction bypass via other operations (e.g. sendTransaction calldata, approve, sign, signAuthorization).
+
+To opt into permissive semantics, register a catch-all ALLOW rule and layer specific DENY rules on top:
+
+wdk.registerPolicy({
+  id: 'permissive-baseline',
+  name: 'Permissive baseline',
+  scope: 'project',
+  rules: [{ name: 'allow-all', operation: '*', action: 'ALLOW', conditions: [] }]
+})`
+
+    test('thrown on DENY carries name, policyId, ruleName, reason, code, and message', async () => {
       getAccountMock.mockResolvedValue(buildAccount())
 
       wdk
@@ -963,9 +1050,11 @@ describe('WDK — policy engine', () => {
       const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
 
       expect(err.name).toBe('PolicyViolationError')
+      expect(err.operation).toBe('sendTransaction')
       expect(err.policyId).toBe('block-eth')
       expect(err.ruleName).toBe('deny-all')
       expect(err.reason).toBe('deny-all')
+      expect(err.code).toBe('RULE_DENIED')
       expect(err.message).toBe('Policy violation: block-eth/deny-all')
       expect(sendTransactionMock).not.toHaveBeenCalled()
     })
@@ -992,6 +1081,7 @@ describe('WDK — policy engine', () => {
       const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
 
       expect(err.name).toBe('PolicyViolationError')
+      expect(err.operation).toBe('sendTransaction')
       expect(err.policyId).toBe('platform-denylist')
       expect(err.ruleName).toBe('block-bad-recipient')
       expect(err.reason).toBe('recipient is on the sanctioned address list')
@@ -1011,7 +1101,7 @@ describe('WDK — policy engine', () => {
             name: 'allow-small',
             operation: 'sendTransaction',
             action: 'ALLOW',
-            conditions: [({ params }) => BigInt(params.value) <= 5n]
+            conditions: [({ args }) => BigInt(args[0].value) <= 5n]
           }]
         })
 
@@ -1019,10 +1109,70 @@ describe('WDK — policy engine', () => {
       const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 100n }))
 
       expect(err.name).toBe('PolicyViolationError')
+      expect(err.operation).toBe('sendTransaction')
       expect(err.policyId).toBe('<unknown>')
       expect(err.ruleName).toBe('<unknown>')
       expect(err.reason).toBe('governed-but-unmatched')
-      expect(err.message).toBe('Policy violation: <unknown>/<unknown>: governed-but-unmatched')
+      expect(err.code).toBe('GOVERNED_BUT_UNMATCHED')
+      expect(err.message).toBe(GOVERNED_BUT_UNMATCHED_MESSAGE)
+    })
+
+    test('a denial because no rule addresses the operation explains the default and how to opt out', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy({
+          id: 'cap-transfer',
+          name: 'Cap transfers',
+          scope: 'project',
+          rules: [{ name: 'cap', operation: 'transfer', action: 'ALLOW', conditions: [] }]
+        })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(err.name).toBe('PolicyViolationError')
+      expect(err.operation).toBe('sendTransaction')
+      expect(err.policyId).toBe('<unknown>')
+      expect(err.ruleName).toBe('<unknown>')
+      expect(err.reason).toBe('no-applicable-rule')
+      expect(err.code).toBe('NO_APPLICABLE_RULE')
+      expect(err.message).toBe(NO_APPLICABLE_RULE_MESSAGE)
+      expect(sendTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('the catch-all snippet in the message registers as-is and lifts the default deny', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy({
+          id: 'cap-transfer',
+          name: 'Cap transfers',
+          scope: 'project',
+          rules: [{ name: 'cap', operation: 'transfer', action: 'ALLOW', conditions: [] }]
+        })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+      const snippet = err.message.slice(err.message.indexOf('wdk.registerPolicy('))
+
+      runInThisContext(`(wdk) => ${snippet}`)(wdk)
+      const result = await account.sendTransaction({ to: RECIPIENT, value: 1n })
+
+      expect(result).toEqual({ hash: DUMMY_TX_HASH })
+      expect(sendTransactionMock).toHaveBeenCalledWith({ to: RECIPIENT, value: 1n })
+    })
+  })
+
+  describe('DENIAL_CODES', () => {
+    test('exposes the three denial codes as their literal values', () => {
+      expect(DENIAL_CODES).toEqual({
+        RULE_DENIED: 'RULE_DENIED',
+        NO_APPLICABLE_RULE: 'NO_APPLICABLE_RULE',
+        GOVERNED_BUT_UNMATCHED: 'GOVERNED_BUT_UNMATCHED'
+      })
     })
   })
 
@@ -1046,7 +1196,7 @@ describe('WDK — policy engine', () => {
       const account = await wdk.getAccount('ethereum', 0)
       const err = await catchAsync(() => account.sign('hello'))
 
-      // sign is in OPERATIONS but no rule addresses it → BLOCK with
+      // sign is governed but no rule addresses it → BLOCK with
       // `no-applicable-rule` (the default-deny semantic, not the old default-allow).
       expect(err.name).toBe('PolicyViolationError')
       expect(err.reason).toBe('no-applicable-rule')
@@ -1095,7 +1245,7 @@ describe('WDK — policy engine', () => {
             name: 'allow-small',
             operation: 'sendTransaction',
             action: 'ALLOW',
-            conditions: [({ params }) => BigInt(params.value) <= 5n]
+            conditions: [({ args }) => BigInt(args[0].value) <= 5n]
           }]
         })
 
@@ -1148,7 +1298,7 @@ describe('WDK — policy engine', () => {
       expect(transferErr.name).toBe('PolicyViolationError')
       expect(transferErr.ruleName).toBe('deny-pair')
 
-      // sign is in OPERATIONS but not addressed by any rule → BLOCK with no-applicable-rule.
+      // sign is governed but not addressed by any rule → BLOCK with no-applicable-rule.
       const sigErr = await catchAsync(() => account.sign('hi'))
       expect(sigErr.reason).toBe('no-applicable-rule')
     })
@@ -1217,8 +1367,8 @@ describe('WDK — policy engine', () => {
             name: 'cap',
             operation: 'sendTransaction',
             action: 'ALLOW',
-            conditions: [({ params }) => {
-              const next = totalSpent + BigInt(params.value)
+            conditions: [({ args }) => {
+              const next = totalSpent + BigInt(args[0].value)
               if (next > cap) return false
               totalSpent = next
               return true
@@ -1319,7 +1469,7 @@ describe('WDK — policy engine', () => {
             name: 'allow-small',
             operation: 'sendTransaction',
             action: 'ALLOW',
-            conditions: [({ params }) => BigInt(params.value) <= 100n]
+            conditions: [({ args }) => BigInt(args[0].value) <= 100n]
           }]
         })
         .registerPolicy({
@@ -1330,7 +1480,7 @@ describe('WDK — policy engine', () => {
             name: 'block-bad',
             operation: 'sendTransaction',
             action: 'DENY',
-            conditions: [({ params }) => params.to === SANCTIONED]
+            conditions: [({ args }) => args[0].to === SANCTIONED]
           }]
         })
 
@@ -1358,7 +1508,7 @@ describe('WDK — policy engine', () => {
             operation: 'sendTransaction',
             action: 'ALLOW',
             override_broader_scope: true,
-            conditions: [({ params }) => BigInt(params.value) <= 100n]
+            conditions: [({ args }) => BigInt(args[0].value) <= 100n]
           }]
         })
         .registerPolicy({
@@ -1397,7 +1547,7 @@ describe('WDK — policy engine', () => {
             operation: 'sendTransaction',
             action: 'ALLOW',
             override_broader_scope: true,
-            conditions: [({ params }) => BigInt(params.value) <= 100n]
+            conditions: [({ args }) => BigInt(args[0].value) <= 100n]
           }]
         })
         .registerPolicy({
@@ -1408,7 +1558,7 @@ describe('WDK — policy engine', () => {
             name: 'block-bad',
             operation: 'sendTransaction',
             action: 'DENY',
-            conditions: [({ params }) => params.to === SANCTIONED]
+            conditions: [({ args }) => args[0].to === SANCTIONED]
           }]
         })
 
@@ -1495,7 +1645,7 @@ describe('WDK — policy engine', () => {
             name: 'allow-small',
             operation: 'sendTransaction',
             action: 'ALLOW',
-            conditions: [({ params }) => BigInt(params.value) <= 5n]
+            conditions: [({ args }) => BigInt(args[0].value) <= 5n]
           }]
         })
 
@@ -1503,6 +1653,7 @@ describe('WDK — policy engine', () => {
       const result = await account.simulate.sendTransaction({ to: RECIPIENT, value: 3n })
 
       expect(result.decision).toBe('ALLOW')
+      expect(result.code).toBeNull()
       expect(result.policy_id).toBe('cap')
       expect(result.matched_rule).toBe('allow-small')
       expect(result.reason).toBe('matched')
@@ -1527,6 +1678,7 @@ describe('WDK — policy engine', () => {
       const result = await account.simulate.sendTransaction({ to: RECIPIENT, value: 1n })
 
       expect(result.decision).toBe('DENY')
+      expect(result.code).toBe('RULE_DENIED')
       expect(result.policy_id).toBe('block-eth')
       expect(result.matched_rule).toBe('deny-all')
       expect(result.reason).toBe('deny-all')
@@ -1543,7 +1695,7 @@ describe('WDK — policy engine', () => {
 
       const account = await wdk.getAccount('ethereum', 0)
 
-      // Every OPERATIONS method present on the account is mirrored on
+      // Every governed method present on the account is mirrored on
       // governed accounts. Calling each via simulate returns a verdict:
       // sign is unaddressed → no-applicable-rule; sendTransaction is the
       // only-send ALLOW rule → matched.
@@ -1551,12 +1703,43 @@ describe('WDK — policy engine', () => {
       const simSend = await account.simulate.sendTransaction({ to: RECIPIENT, value: 1n })
 
       expect(simSign.decision).toBe('DENY')
+      expect(simSign.code).toBe('NO_APPLICABLE_RULE')
       expect(simSign.policy_id).toBeNull()
       expect(simSign.matched_rule).toBeNull()
       expect(simSign.reason).toBe('no-applicable-rule')
       expect(simSend.decision).toBe('ALLOW')
+      expect(simSend.code).toBeNull()
       expect(simSend.policy_id).toBe('only-send')
       expect(signMock).not.toHaveBeenCalled()
+    })
+
+    test('simulate.<method> returns DENY with governed-but-unmatched when rules address the operation but none match', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy({
+          id: 'sanctions',
+          name: 'sanctions',
+          scope: 'project',
+          rules: [{
+            name: 'deny-sanctioned',
+            operation: 'transfer',
+            action: 'DENY',
+            conditions: [({ args }) => args[0].recipient === SANCTIONED]
+          }]
+        })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const result = await account.simulate.transfer({ token: TOKEN, recipient: RECIPIENT, amount: 1n })
+
+      expect(result.decision).toBe('DENY')
+      expect(result.code).toBe('GOVERNED_BUT_UNMATCHED')
+      expect(result.policy_id).toBeNull()
+      expect(result.matched_rule).toBeNull()
+      expect(result.reason).toBe('governed-but-unmatched')
+      expect(result.trace).toEqual([{ scope: 'project', policy_id: 'sanctions', rule_name: 'deny-sanctioned', matched: false }])
+      expect(transferMock).not.toHaveBeenCalled()
     })
   })
 
@@ -1594,7 +1777,7 @@ describe('WDK — policy engine', () => {
       expect(condition).toHaveBeenCalledWith(expect.objectContaining({
         operation: 'approve',
         wallet: 'ethereum',
-        params: { token: TOKEN, spender: SPENDER, amount: 1n }
+        args: [{ token: TOKEN, spender: SPENDER, amount: 1n }]
       }))
       expect(sendTransactionMock).toHaveBeenCalledTimes(1)
       expect(sendTransactionMock).toHaveBeenCalledWith({ to: SPENDER, value: 0n })
@@ -1636,12 +1819,12 @@ describe('WDK — policy engine', () => {
       expect(condition).toHaveBeenNthCalledWith(1, expect.objectContaining({
         operation: 'sendTransaction',
         wallet: 'ethereum',
-        params: { to: RECIPIENT, value: 1n }
+        args: [{ to: RECIPIENT, value: 1n }]
       }))
       expect(condition).toHaveBeenNthCalledWith(2, expect.objectContaining({
         operation: 'sendTransaction',
         wallet: 'ethereum',
-        params: { to: RECIPIENT, value: 2n }
+        args: [{ to: RECIPIENT, value: 2n }]
       }))
       expect(sendTransactionMock).toHaveBeenCalledTimes(2)
       expect(sendTransactionMock).toHaveBeenNthCalledWith(1, { to: RECIPIENT, value: 1n })
@@ -1687,13 +1870,13 @@ describe('WDK — policy engine', () => {
   describe('context immutability', () => {
     const ATTACKER_VALUE = 1_000_000_000_000_000_000n
 
-    test('mutating the params object after the call starts does not change what conditions saw', async () => {
+    test('mutating the argument object after the call starts does not change what conditions saw', async () => {
       let observedTo
 
       // Slow async condition gives the user time to mutate the original object.
-      const condition = jest.fn(async ({ params }) => {
+      const condition = jest.fn(async ({ args }) => {
         await new Promise((resolve) => setTimeout(resolve, 30))
-        observedTo = params.to
+        observedTo = args[0].to
         return true
       })
 
@@ -1720,9 +1903,9 @@ describe('WDK — policy engine', () => {
     })
 
     test('mutating the tx after the call starts does not change what the wallet receives', async () => {
-      const condition = jest.fn(async ({ params }) => {
+      const condition = jest.fn(async ({ args }) => {
         await new Promise((resolve) => setTimeout(resolve, 30))
-        return params.to === RECIPIENT && params.value <= 5n
+        return args[0].to === RECIPIENT && args[0].value <= 5n
       })
 
       getAccountMock.mockResolvedValue(buildAccount())
@@ -1751,8 +1934,8 @@ describe('WDK — policy engine', () => {
 
     test('an argument whose getter returns different values per read cannot split the check from execution', async () => {
       let evaluatedValue
-      const condition = jest.fn(({ params }) => {
-        evaluatedValue = params.value
+      const condition = jest.fn(({ args }) => {
+        evaluatedValue = args[0].value
         return true
       })
 
@@ -1781,8 +1964,8 @@ describe('WDK — policy engine', () => {
     })
 
     test('a condition function cannot mutate its way into the underlying call', async () => {
-      const condition = jest.fn(({ params }) => {
-        params.to = SANCTIONED // mutation should not propagate
+      const condition = jest.fn(({ args }) => {
+        args[0].to = SANCTIONED // mutation should not propagate
         return true
       })
 
@@ -2132,7 +2315,7 @@ describe('WDK — policy engine', () => {
   // -------------------------------------------------------------------------
 
   describe('context object', () => {
-    test('the condition function receives operation, wallet, params, args, and a read-only account', async () => {
+    test('the condition function receives operation, wallet, args, and a read-only account', async () => {
       let captured
 
       getAccountMock.mockResolvedValue(buildAccount())
@@ -2156,14 +2339,70 @@ describe('WDK — policy engine', () => {
 
       expect(captured.operation).toBe('sendTransaction')
       expect(captured.wallet).toBe('base')
-      expect(captured.params).toEqual({ to: RECIPIENT, value: 7n })
       expect(captured.args).toHaveLength(2)
       expect(captured.args[0]).toEqual({ to: RECIPIENT, value: 7n })
       expect(captured.args[1]).toEqual({ gas: 21000 })
+      expect(captured.params).toBeUndefined()
       expect(captured.account.path).toBe(PATH_DEFAULT)
       expect(captured.account.sendTransaction).toBeUndefined()
       expect(captured.account.transfer).toBeUndefined()
       expect(Object.isFrozen(captured)).toBe(true)
+    })
+
+    test('a condition can gate a multi-argument operation on an argument other than the first', async () => {
+      const swidgeInstanceMock = jest.fn().mockResolvedValue(DUMMY_SWIDGE_RESULT)
+
+      class MySwidgeProtocol extends SwidgeProtocol {
+        constructor () { super() }
+        async swidge (options, config) { return swidgeInstanceMock(options, config) }
+      }
+
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      const observedArgs = []
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerProtocol('ethereum', 'bridge-and-swap', MySwidgeProtocol, {})
+        .registerPolicy({
+          id: 'protocol-fee-cap',
+          name: 'protocol-fee-cap',
+          scope: 'project',
+          rules: [
+            {
+              name: 'deny-uncapped-protocol-fee',
+              operation: 'swidge',
+              action: 'DENY',
+              conditions: [({ args }) => {
+                observedArgs.push(args)
+                return args[1] === undefined || args[1].maxProtocolFeeBps > 50
+              }]
+            },
+            { name: 'allow-swidge', operation: 'swidge', action: 'ALLOW', conditions: [] }
+          ]
+        })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const swidge = account.getSwidgeProtocol('bridge-and-swap')
+
+      const options = { fromToken: 'A', toToken: 'B', fromTokenAmount: 1n }
+      const allowed = await swidge.swidge(options, { maxProtocolFeeBps: 25 })
+      const overCap = await catchAsync(() => swidge.swidge(options, { maxProtocolFeeBps: 500 }))
+      const noConfig = await catchAsync(() => swidge.swidge(options))
+
+      expect(allowed).toEqual(DUMMY_SWIDGE_RESULT)
+      expect(overCap.name).toBe('PolicyViolationError')
+      expect(overCap.policyId).toBe('protocol-fee-cap')
+      expect(overCap.ruleName).toBe('deny-uncapped-protocol-fee')
+      expect(noConfig.name).toBe('PolicyViolationError')
+      expect(noConfig.ruleName).toBe('deny-uncapped-protocol-fee')
+      expect(swidgeInstanceMock).toHaveBeenCalledTimes(1)
+      expect(swidgeInstanceMock).toHaveBeenCalledWith(options, { maxProtocolFeeBps: 25 })
+      expect(observedArgs).toEqual([
+        [options, { maxProtocolFeeBps: 25 }],
+        [options, { maxProtocolFeeBps: 500 }],
+        [options]
+      ])
     })
   })
 
@@ -2279,6 +2518,126 @@ describe('WDK — policy engine', () => {
       expect(result.hash).toBe(DUMMY_TX_HASH)
       expect(invoked).toBe(1)
       expect(sendTransactionMock).toHaveBeenCalledWith({ to: RECIPIENT, value: 1n })
+    })
+
+    test('each policy is raced against the conditionTimeoutMs it was registered with', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(neverResolvingDeny('fast', 'sendTransaction'), { conditionTimeoutMs: 25 })
+        .registerPolicy(neverResolvingDeny('slow', 'signTransaction'), { conditionTimeoutMs: 75 })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const fastErr = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+      const slowErr = await catchAsync(() => account.signTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(fastErr.reason).toBe('fast-rule (condition error: condition timed out after 25ms)')
+      expect(slowErr.reason).toBe('slow-rule (condition error: condition timed out after 75ms)')
+      expect(sendTransactionMock).not.toHaveBeenCalled()
+      expect(signTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('the timeout applied to a policy is independent of registration order', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(neverResolvingDeny('slow', 'signTransaction'), { conditionTimeoutMs: 75 })
+        .registerPolicy(neverResolvingDeny('fast', 'sendTransaction'), { conditionTimeoutMs: 25 })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const fastErr = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+      const slowErr = await catchAsync(() => account.signTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(fastErr.reason).toBe('fast-rule (condition error: condition timed out after 25ms)')
+      expect(slowErr.reason).toBe('slow-rule (condition error: condition timed out after 75ms)')
+      expect(sendTransactionMock).not.toHaveBeenCalled()
+      expect(signTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('a policy registered without conditionTimeoutMs keeps the default timeout when a later policy sets a shorter one', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(slowAllow('default-timeout', 'sendTransaction', 60))
+        .registerPolicy(slowAllow('short-timeout', 'signTransaction', 60), { conditionTimeoutMs: 25 })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const result = await account.sendTransaction({ to: RECIPIENT, value: 1n })
+      const err = await catchAsync(() => account.signTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(result.hash).toBe(DUMMY_TX_HASH)
+      expect(sendTransactionMock).toHaveBeenCalledWith({ to: RECIPIENT, value: 1n })
+      expect(err.reason).toBe('governed-but-unmatched')
+      expect(signTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('maxConditionTimeoutMs caps a policy that asks for a longer timeout', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      const cappedWdk = new WDK(SEED_PHRASE, { maxConditionTimeoutMs: 30 })
+
+      cappedWdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(neverResolvingDeny('over-ceiling', 'sendTransaction'), { conditionTimeoutMs: 5_000 })
+
+      const account = await cappedWdk.getAccount('ethereum', 0)
+      const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(err.reason).toBe('over-ceiling-rule (condition error: condition timed out after 30ms)')
+      expect(sendTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('maxConditionTimeoutMs caps the default timeout too', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      const cappedWdk = new WDK(SEED_PHRASE, { maxConditionTimeoutMs: 30 })
+
+      cappedWdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(neverResolvingDeny('no-timeout-option', 'sendTransaction'))
+
+      const account = await cappedWdk.getAccount('ethereum', 0)
+      const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(err.reason).toBe('no-timeout-option-rule (condition error: condition timed out after 30ms)')
+      expect(sendTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('a policy asking for less than the ceiling keeps its own timeout', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      const cappedWdk = new WDK(SEED_PHRASE, { maxConditionTimeoutMs: 5_000 })
+
+      cappedWdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(neverResolvingDeny('under-ceiling', 'sendTransaction'), { conditionTimeoutMs: 25 })
+
+      const account = await cappedWdk.getAccount('ethereum', 0)
+      const err = await catchAsync(() => account.sendTransaction({ to: RECIPIENT, value: 1n }))
+
+      expect(err.reason).toBe('under-ceiling-rule (condition error: condition timed out after 25ms)')
+      expect(sendTransactionMock).not.toHaveBeenCalled()
+    })
+
+    test('rejects a non-positive maxConditionTimeoutMs at construction time', () => {
+      const cases = [
+        { value: -1, message: "WDK options: 'maxConditionTimeoutMs': Too small: expected number to be >0" },
+        { value: 0, message: "WDK options: 'maxConditionTimeoutMs': Too small: expected number to be >0" },
+        { value: NaN, message: "WDK options: 'maxConditionTimeoutMs': Invalid input: expected number, received NaN" },
+        { value: Infinity, message: "WDK options: 'maxConditionTimeoutMs': Invalid input: expected number, received number" },
+        { value: '30000', message: "WDK options: 'maxConditionTimeoutMs': Invalid input: expected number, received string" },
+        { value: null, message: "WDK options: 'maxConditionTimeoutMs': Invalid input: expected number, received null" }
+      ]
+
+      for (const { value, message } of cases) {
+        const err = catchSync(() => new WDK(SEED_PHRASE, { maxConditionTimeoutMs: value }))
+
+        expect(err.name).toBe('PolicyConfigurationError')
+        expect(err.message).toBe(message)
+      }
     })
   })
 
@@ -2550,6 +2909,338 @@ describe('WDK — policy engine', () => {
         expect(err.name).toBe('PolicyConfigurationError')
         expect(err.message).toBe(message)
       }
+    })
+  })
+  // -------------------------------------------------------------------------
+  // Method coverage: deny-by-default proxy + exclusion set
+  // -------------------------------------------------------------------------
+
+  describe('method coverage', () => {
+    test('a method absent from the exclusion set is governed and denied when no rule addresses it', async () => {
+      const payLightningInvoiceMock = jest.fn().mockResolvedValue(DUMMY_LIGHTNING_PAYMENT)
+
+      getAccountMock.mockResolvedValue(buildAccount(PATH_DEFAULT, { payLightningInvoice: payLightningInvoiceMock }))
+
+      wdk
+        .registerWallet('spark', WalletManagerMock, {})
+        .registerPolicy(projectAllowAll('p'))
+
+      const account = await wdk.getAccount('spark', 0)
+      const err = await catchAsync(() => account.payLightningInvoice({ invoice: 'lnbc1' }))
+
+      expect(err.name).toBe('PolicyViolationError')
+      expect(err.reason).toBe('no-applicable-rule')
+      expect(payLightningInvoiceMock).not.toHaveBeenCalled()
+    })
+
+    test('a method in DEFAULT_POLICY_EXCLUSIONS executes without consulting the engine', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(projectDenyAll('deny-everything'))
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const balance = await account.getBalance()
+
+      expect(DEFAULT_POLICY_EXCLUSIONS).toContain('getBalance')
+      expect(balance).toBe(DUMMY_BALANCE)
+      expect(getBalanceMock).toHaveBeenCalledTimes(1)
+    })
+
+    test('a method in the consumer exclusion list executes without consulting the engine', async () => {
+      const syncWalletBalanceMock = jest.fn().mockResolvedValue(undefined)
+
+      getAccountMock.mockResolvedValue(buildAccount(PATH_DEFAULT, { syncWalletBalance: syncWalletBalanceMock }))
+
+      const sparkWdk = new WDK(SEED_PHRASE, { policyExclusions: ['syncWalletBalance'] })
+
+      sparkWdk
+        .registerWallet('spark', WalletManagerMock, {})
+        .registerPolicy(projectDenyAll('deny-everything'))
+
+      const account = await sparkWdk.getAccount('spark', 0)
+      await account.syncWalletBalance()
+
+      expect(syncWalletBalanceMock).toHaveBeenCalledTimes(1)
+    })
+
+    test('a name in both the defaults and the consumer list appears once in the resolved set', () => {
+      const dupWdk = new WDK(SEED_PHRASE, { policyExclusions: ['getBalance', 'getBalance', 'syncWalletBalance'] })
+
+      const resolved = dupWdk.getPolicyExclusions()
+      const occurrences = resolved.filter((name) => name === 'getBalance')
+
+      expect(occurrences).toEqual(['getBalance'])
+      expect(resolved).toContain('syncWalletBalance')
+      expect(resolved.length).toBe(74)
+    })
+
+    test('an empty or omitted policyExclusions resolves to exactly the defaults', () => {
+      const emptyWdk = new WDK(SEED_PHRASE, { policyExclusions: [] })
+      const omittedWdk = new WDK(SEED_PHRASE)
+
+      expect(emptyWdk.getPolicyExclusions().length).toBe(73)
+      expect(omittedWdk.getPolicyExclusions().length).toBe(73)
+      expect(emptyWdk.getPolicyExclusions()).toEqual(omittedWdk.getPolicyExclusions())
+    })
+
+    test('rejects a non-string entry in policyExclusions at construction time', () => {
+      const cases = [
+        { value: [42], message: "WDK options: 'policyExclusions.0': Invalid input: expected string, received number" },
+        { value: [''], message: "WDK options: 'policyExclusions.0': Too small: expected string to have >=1 characters" },
+        { value: ['getBalance', null], message: "WDK options: 'policyExclusions.1': Invalid input: expected string, received null" },
+        { value: 'getBalance', message: "WDK options: 'policyExclusions': Invalid input: expected array, received string" }
+      ]
+
+      for (const { value, message } of cases) {
+        const err = catchSync(() => new WDK(SEED_PHRASE, { policyExclusions: value }))
+
+        expect(err.name).toBe('PolicyConfigurationError')
+        expect(err.message).toBe(message)
+      }
+    })
+
+    test('an exclusion naming a method no registered wallet has is accepted without error', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      const futureWdk = new WDK(SEED_PHRASE, { policyExclusions: ['methodShippingNextRelease'] })
+
+      futureWdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(projectAllowAll('p'))
+
+      const account = await futureWdk.getAccount('ethereum', 0)
+      const result = await account.sendTransaction({ to: RECIPIENT, value: 1n })
+
+      expect(futureWdk.getPolicyExclusions()).toContain('methodShippingNextRelease')
+      expect(result.hash).toBe(DUMMY_TX_HASH)
+    })
+
+    test('getPolicyExclusions returns a frozen array that cannot mutate engine state', () => {
+      const frozenWdk = new WDK(SEED_PHRASE, { policyExclusions: ['syncWalletBalance'] })
+
+      const resolved = frozenWdk.getPolicyExclusions()
+
+      expect(Object.isFrozen(resolved)).toBe(true)
+      expect(catchSync(() => resolved.push('sendTransaction')).name).toBe('TypeError')
+      expect(frozenWdk.getPolicyExclusions()).not.toContain('sendTransaction')
+    })
+
+    test('an account with no registered policies passes every call through untouched', async () => {
+      const rawAccount = buildAccount()
+
+      getAccountMock.mockResolvedValue(rawAccount)
+
+      wdk.registerWallet('ethereum', WalletManagerMock, {})
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const result = await account.sendTransaction({ to: RECIPIENT, value: 1n })
+
+      expect(account.sendTransaction).toBe(rawAccount.sendTransaction)
+      expect(result.hash).toBe(DUMMY_TX_HASH)
+      expect(sendTransactionMock).toHaveBeenCalledWith({ to: RECIPIENT, value: 1n })
+    })
+
+    test('a method inherited from a parent class is governed', async () => {
+      class BaseAccount {
+        async payLightningInvoice (options) { return payInheritedMock(options) }
+      }
+
+      class ChildAccount extends BaseAccount {}
+
+      const inherited = Object.assign(new ChildAccount(), buildAccount())
+
+      getAccountMock.mockResolvedValue(inherited)
+
+      wdk
+        .registerWallet('spark', WalletManagerMock, {})
+        .registerPolicy(projectAllowAll('p'))
+
+      const account = await wdk.getAccount('spark', 0)
+      const err = await catchAsync(() => account.payLightningInvoice({ invoice: 'lnbc1' }))
+
+      expect(err.name).toBe('PolicyViolationError')
+      expect(err.reason).toBe('no-applicable-rule')
+      expect(payInheritedMock).not.toHaveBeenCalled()
+    })
+
+    test('an accessor property is not intercepted and its getter is not invoked during wrapping', async () => {
+      let reads = 0
+      const withAccessor = buildAccount()
+
+      Object.defineProperty(withAccessor, 'chainId', {
+        get () { reads += 1; return 1 },
+        enumerable: true,
+        configurable: true
+      })
+
+      getAccountMock.mockResolvedValue(withAccessor)
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(projectDenyAll('deny-everything'))
+
+      const account = await wdk.getAccount('ethereum', 0)
+
+      expect(reads).toBe(0)
+      expect(account.chainId).toBe(1)
+      expect(reads).toBe(1)
+    })
+    test('rejects a rule that addresses an excluded method, which could never fire', () => {
+      wdk.registerWallet('ethereum', WalletManagerMock, {})
+
+      const err = catchSync(() => wdk.registerPolicy({
+        id: 'no-address',
+        name: 'no-address',
+        scope: 'project',
+        rules: [{ name: 'deny-getAddress', operation: 'getAddress', action: 'DENY', conditions: [] }]
+      }))
+
+      expect(err.name).toBe('PolicyConfigurationError')
+      expect(err.message).toBe(
+        "Rule 'deny-getAddress' in policy 'no-address': 'getAddress' is an excluded method, so this rule could never be evaluated. " +
+        "Remove it from the rule, or drop the method from the 'policyExclusions' option so calls to it reach the engine."
+      )
+    })
+
+    test('rejects an excluded method named inside an operation array', () => {
+      wdk.registerWallet('ethereum', WalletManagerMock, {})
+
+      const err = catchSync(() => wdk.registerPolicy({
+        id: 'mixed',
+        name: 'mixed',
+        scope: 'project',
+        rules: [{ name: 'r', operation: ['sendTransaction', 'getBalance'], action: 'DENY', conditions: [] }]
+      }))
+
+      expect(err.name).toBe('PolicyConfigurationError')
+      expect(err.message).toContain("'getBalance' is an excluded method")
+    })
+
+    test('the wildcard is not treated as an excluded method', async () => {
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(projectDenyAll('deny-all-wildcard'))
+
+      const account = await wdk.getAccount('ethereum', 0)
+
+      expect(await account.getBalance()).toBe(DUMMY_BALANCE)
+    })
+
+    test('a protocol method outside the known verb list is governed and mirrored in simulate', async () => {
+      const setUserEModeMock = jest.fn().mockResolvedValue(DUMMY_EMODE_RESULT)
+
+      class MyLendingProtocol extends LendingProtocol {
+        constructor () { super() }
+        async supply (opts) { return supplyMock(opts) }
+        async setUserEMode (category) { return setUserEModeMock(category) }
+      }
+
+      getAccountMock.mockResolvedValue(buildAccount())
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerProtocol('ethereum', 'aave', MyLendingProtocol, {})
+        .registerPolicy({
+          id: 'lending',
+          name: 'lending',
+          scope: 'project',
+          rules: [{ name: 'allow-supply', operation: 'supply', action: 'ALLOW', conditions: [] }]
+        })
+
+      const account = await wdk.getAccount('ethereum', 0)
+      const lending = account.getLendingProtocol('aave')
+
+      const err = await catchAsync(() => lending.setUserEMode(2))
+      const sim = await account.simulate.getLendingProtocol('aave').setUserEMode(2)
+
+      expect(err.name).toBe('PolicyViolationError')
+      expect(err.reason).toBe('no-applicable-rule')
+      expect(setUserEModeMock).not.toHaveBeenCalled()
+      expect(sim.decision).toBe('DENY')
+      expect(sim.policy_id).toBe(null)
+      expect(sim.matched_rule).toBe(null)
+      expect(sim.reason).toBe('no-applicable-rule')
+    })
+
+    test('a governed synchronous method resolves through a promise instead of returning directly', async () => {
+      const account = buildAccount()
+
+      account.describeAccount = () => 'dummy-sync-value'
+
+      getAccountMock.mockResolvedValue(account)
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy({
+          id: 'permissive',
+          name: 'permissive',
+          scope: 'project',
+          rules: [{ name: 'allow-all', operation: '*', action: 'ALLOW', conditions: [] }]
+        })
+
+      const governed = await wdk.getAccount('ethereum', 0)
+      const returned = governed.describeAccount()
+
+      expect(returned).toBeInstanceOf(Promise)
+      expect(await returned).toBe('dummy-sync-value')
+    })
+
+    test('two instances of the same class governed by engines with different exclusions do not share a resolution', async () => {
+      class SharedProto {
+        async syncWalletBalance () { return 'dummy-synced' }
+        async payLightningInvoice () { return payInheritedMock() }
+      }
+
+      getAccountMock.mockImplementation(async () => Object.assign(new SharedProto(), buildAccount()))
+
+      const strict = new WDK(SEED_PHRASE)
+      const lenient = new WDK(SEED_PHRASE, { policyExclusions: ['syncWalletBalance'] })
+
+      for (const instance of [strict, lenient]) {
+        instance
+          .registerWallet('spark', WalletManagerMock, {})
+          .registerPolicy(projectAllowAll('p'))
+      }
+
+      const strictAccount = await strict.getAccount('spark', 0)
+      const lenientAccount = await lenient.getAccount('spark', 0)
+
+      const strictErr = await catchAsync(() => strictAccount.syncWalletBalance())
+
+      expect(strictErr.name).toBe('PolicyViolationError')
+      expect(strictErr.reason).toBe('no-applicable-rule')
+      expect(await lenientAccount.syncWalletBalance()).toBe('dummy-synced')
+    })
+
+    test('a prototype method shadowed by an own accessor is bound without invoking the accessor', async () => {
+      let reads = 0
+
+      class BaseShadow {
+        async doThing () { return 'dummy-from-prototype' }
+      }
+
+      const shadowed = Object.assign(new BaseShadow(), buildAccount())
+
+      Object.defineProperty(shadowed, 'doThing', {
+        get () { reads += 1; return async () => 'dummy-from-getter' },
+        configurable: true
+      })
+
+      getAccountMock.mockResolvedValue(shadowed)
+
+      wdk
+        .registerWallet('ethereum', WalletManagerMock, {})
+        .registerPolicy(projectAllowAll('p'))
+
+      const account = await wdk.getAccount('ethereum', 0)
+
+      expect(reads).toBe(0)
+      expect(account.doThing).toBeInstanceOf(Function)
+      expect(reads).toBe(0)
     })
   })
 })
