@@ -16,16 +16,20 @@
 
 import { z } from 'zod'
 
-import { ACTIONS, OPERATIONS, SCOPES, WILDCARD } from './constants.js'
+import { ACTIONS, SCOPES } from './constants.js'
 
 /** @typedef {import('zod').ZodError} ZodError */
 /** @typedef {import('./policy-engine.js').Policy} Policy */
 
-const OPERATION_NAMES = [...OPERATIONS, WILDCARD]
+// Any callable a wallet or protocol exposes can be governed, so a rule may
+// name any method. Validating against a fixed enum would make the newly
+// governed methods unaddressable — a rule for Spark's payLightningInvoice
+// would fail registration while the engine denies every call to it.
+const operationName = z.string().min(1)
 
 const operationField = z.union([
-  z.enum(OPERATION_NAMES),
-  z.array(z.enum(OPERATION_NAMES)).nonempty()
+  operationName,
+  z.array(operationName).nonempty()
 ])
 
 const accountIdentifier = z.union([
@@ -95,6 +99,15 @@ export const registerOptionsSchema = z.object({
 }).optional()
 
 /**
+ * Zod schema for the optional engine options bag accepted by the `WDK`
+ * and `PolicyEngine` constructors.
+ */
+export const engineOptionsSchema = z.object({
+  maxConditionTimeoutMs: z.number().finite().positive().optional(),
+  policyExclusions: z.array(z.string().min(1)).optional()
+}).optional()
+
+/**
  * Normalises the wallet field of a parsed policy into an array of
  * non-empty strings or `undefined` (meaning "apply to every registered wallet").
  *
@@ -149,8 +162,24 @@ export function formatPolicyError (zodError, policy) {
  * @returns {string} A human-readable message prefixed with `registerPolicy options`.
  */
 export function formatRegisterOptionsError (zodError) {
+  return formatOptionsError(zodError, 'registerPolicy options')
+}
+
+/**
+ * Builds a human-readable message for the first issue in a ZodError thrown
+ * by the engine options schema.
+ *
+ * @internal
+ * @param {ZodError} zodError - The error returned by `engineOptionsSchema.safeParse`.
+ * @returns {string} A human-readable message prefixed with `WDK options`.
+ */
+export function formatEngineOptionsError (zodError) {
+  return formatOptionsError(zodError, 'WDK options')
+}
+
+function formatOptionsError (zodError, prefix) {
   const issue = zodError.issues[0]
   const pathStr = issue.path.join('.')
 
-  return `registerPolicy options${pathStr ? `: '${pathStr}'` : ''}: ${issue.message}`
+  return `${prefix}${pathStr ? `: '${pathStr}'` : ''}: ${issue.message}`
 }
